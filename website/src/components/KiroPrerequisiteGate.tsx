@@ -365,6 +365,22 @@ function remedySteps(remedy: string): React.ReactNode {
           </li>
         </ul>
       )
+    case 'userns_cap_zero':
+      // The probe read the cap as 0, so the fix is certain: raise it now, and
+      // persist it so a reboot does not put the host back at 0.
+      return (
+        <ul className="mt-2 list-none space-y-3">
+          <li className="text-sm leading-relaxed text-muted">
+            {i18nT('components.kiroPrerequisiteGate.remedy_userns_cap_zero')}
+            <CopyCommand>
+              <code>sudo sysctl -w user.max_user_namespaces=15000</code>
+            </CopyCommand>
+            <CopyCommand>
+              <code>{"echo 'user.max_user_namespaces=15000' | sudo tee /etc/sysctl.d/99-userns.conf"}</code>
+            </CopyCommand>
+          </li>
+        </ul>
+      )
     case 'userns_denied':
       return (
         <ul className="mt-2 list-none space-y-3">
@@ -487,8 +503,14 @@ function SandboxUnavailable({
   // Those two mechanisms therefore override the body. The other tokens leave
   // it alone — for them the host genuinely offers no usable namespace, and
   // their remedy step carries the specifics.
-  const body =
-    failureKind === 'transient'
+  //
+  // A cap the probe read as 0 wins for every kind: the ENOSPC verdict stays
+  // transient (never cached), but its cause is certain, so neither the
+  // temporary-limit body nor the generic no-sandbox one describes it.
+  const capZero = remedy === 'userns_cap_zero'
+  const body = capZero
+    ? i18nT('components.kiroPrerequisiteGate.userns_cap_zero_body')
+    : failureKind === 'transient'
       ? i18nT('components.kiroPrerequisiteGate.the_check_hit_a_temporary_limit_and_was_not_cach')
       : failureKind === 'foreign_sandbox'
         ? i18nT('components.kiroPrerequisiteGate.another_sandbox_already_confines_kiro_crew_so_it')
@@ -498,8 +520,9 @@ function SandboxUnavailable({
             ? i18nT('components.kiroPrerequisiteGate.this_container_grants_namespaces_but_refuses_mount')
             : i18nT('components.kiroPrerequisiteGate.this_host_provides_no_os_level_sandbox_so_kiro_c')
   // A momentary failure that clears on retry should not be dressed in the same
-  // alarm red as a host-level verdict — the body immediately walks that back.
-  const transient = failureKind === 'transient'
+  // alarm red as a host-level verdict — the body immediately walks that back. A
+  // disabled cap is a host-level verdict whatever the kind, so it is not one.
+  const transient = failureKind === 'transient' && !capZero
   const tone = transient ? 'bg-accent-subtle text-accent' : 'bg-danger/10 text-danger-text'
   const eyebrowTone = transient ? 'text-accent' : 'text-danger'
   return (
@@ -529,7 +552,7 @@ function SandboxUnavailable({
             still shows one when the probe named a mechanism: the cap case is
             reported transient forever, so suppressing it here was the difference
             between a fixable host and a dead end. */}
-        {(failureKind === 'no_backend' || (transient && remedy)) && (
+        {(failureKind === 'no_backend' || (transient && remedy) || capZero) && (
           <SandboxRemedy remedy={remedy} transient={transient} />
         )}
         {detail ? (
