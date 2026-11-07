@@ -1,0 +1,293 @@
+name: Shots 32211 (throwaway)
+
+# THROWAWAY, never part of a pull request. Screenshots KiroCrew PR #32211's two
+# UI surfaces on a real Linux host whose user.max_user_namespaces is 0:
+#   - the first-run KiroPrerequisiteGate (userns_cap_zero: danger tone, How to
+#     fix, the sysctl and /etc/sysctl.d/ commands), light and dark;
+#   - Settings > Remote Crew > Set up a new one, whose AWS check is refused by
+#     the sandbox before any aws process starts, light and dark.
+# Nothing is mocked: the workflow sets the sysctl, the gateway's own probe
+# reports userns_cap_zero, and the browser talks to that gateway.
+# Scripts: .github/shots-32211/ (gateway.py, capture.mjs).
+
+on:
+  push:
+    branches: [ci/32211-linux-screenshots]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: shots-32211-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shots:
+    name: Linux screenshots (user.max_user_namespaces=0)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # runner.temp is not available to job-level env, so the paths are
+      # published once here. Both gateway homes live under the runner's temp
+      # dir, never ~/.kiro/crew.
+      - name: Resolve paths
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/shots-32211"
+          {
+            echo "SHOTS_OUT=$root/out"
+            echo "MEASUREMENTS=$root/out/measurements.json"
+            echo "GATE_HOME=$root/homes/gate"
+            echo "CREW_HOME=$root/homes/crew"
+            echo "STATE_DIR=$root/state"
+            echo "WEBSITE_DIR=$GITHUB_WORKSPACE/website"
+            echo "SHOTS=$GITHUB_WORKSPACE/.github/shots-32211"
+          } >> "$GITHUB_ENV"
+          mkdir -p "$root/out/logs" "$root/homes" "$root/state"
+          chmod 700 "$root/state"
+
+      # ── build and install, exactly as ci.yml's E2E job does ──
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            setup.cfg
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+
+      - name: Install backend (+ dev)
+        run: uv pip install --system setuptools -e ".[voice,desktop]" --group dev
+
+      - name: Install frontend deps
+        working-directory: website
+        run: npm ci --no-audit --no-fund
+
+      - name: Build frontend
+        working-directory: website
+        run: npm run build
+
+      - name: Stage frontend into package
+        run: |
+          rm -rf src/kiro_crew/static/dist
+          mkdir -p src/kiro_crew/static
+          cp -R website/dist src/kiro_crew/static/dist
+
+      - name: Resolve Playwright version
+        working-directory: website
+        run: |
+          version="$(node -p \
+            "require('./package-lock.json').packages['node_modules/@playwright/test'].version")"
+          echo "@playwright/test $version"
+          echo "PLAYWRIGHT_BROWSERS_PATH=$RUNNER_TEMP/ms-playwright" >> "$GITHUB_ENV"
+
+      # Same as ci.yml: no --with-deps (its apt-get update stalls), capped.
+      - name: Install Playwright browser (Chromium)
+        timeout-minutes: 6
+        working-directory: website
+        run: npx playwright install chromium
+
+      - name: Parse-check the helper scripts
+        run: |
+          python -m py_compile "$SHOTS/gateway.py"
+          node --check "$SHOTS/capture.mjs"
+
+      # ── stock host state, kept so the restore step can put it back ──
+      - name: Record the stock user-namespace settings
+        run: |
+          set -euo pipefail
+          echo "USERNS_CAP_ORIG=$(cat /proc/sys/user/max_user_namespaces)" >> "$GITHUB_ENV"
+          echo "APPARMOR_USERNS_ORIG=$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || true)" >> "$GITHUB_ENV"
+          uname -a
+          sysctl user.max_user_namespaces kernel.apparmor_restrict_unprivileged_userns || true
+          python "$SHOTS/gateway.py" --measurements "$MEASUREMENTS" run-info
+          python "$SHOTS/gateway.py" --measurements "$MEASUREMENTS" host-state --label stock
+
+      # ── seed the established install the Remote Crew shot needs ──
+      # Settings sits behind the first-run gate, so the Remote Crew panel is only
+      # reachable on an install that already finished first-run setup. That is
+      # seeded the way the product records it: the gateway's own probe runs the
+      # CLI's --version and whoami inside the sandbox and writes the marker. The
+      # sandbox needs working user namespaces for that, so this step lifts
+      # Ubuntu's AppArmor userns restriction (as ci.yml's sandbox job does) and
+      # puts it back before the cap is set to 0.
+      - name: Seed an established install (sandbox working)
+        id: seed
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          H="python $SHOTS/gateway.py --measurements $MEASUREMENTS"
+          cleanup() {
+            $H stop --state "$STATE_DIR/seed.json" || true
+            if [ -n "$APPARMOR_USERNS_ORIG" ]; then
+              sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns="$APPARMOR_USERNS_ORIG" || true
+            fi
+          }
+          trap cleanup EXIT
+          if [ -n "$APPARMOR_USERNS_ORIG" ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          $H host-state --label seed
+          KIROCREW_HOME="$CREW_HOME" python -m kiro_crew config set instances.enabled true
+          $H note --key seeding.crew_instances_enabled --json \
+            '{"how": "KIROCREW_HOME=<crew home> python -m kiro_crew config set instances.enabled true", "why": "Remote Crew management is off by default; the panel shows only its enable card until it is on"}'
+          $H start --name seed --home "$CREW_HOME" --log-dir "$SHOTS_OUT/logs" --state "$STATE_DIR/seed.json"
+          $H wait-setup --state "$STATE_DIR/seed.json" --key seeding.crew_first_run_setup
+
+      # ── the reported state, for real ──
+      - name: Put the host at user.max_user_namespaces=0
+        id: capzero
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          sudo sysctl -w user.max_user_namespaces=0
+          echo "max_user_namespaces now: $(cat /proc/sys/user/max_user_namespaces)"
+          sysctl kernel.apparmor_restrict_unprivileged_userns || true
+          python "$SHOTS/gateway.py" --measurements "$MEASUREMENTS" host-state --label cap_zero --expect-cap-zero
+
+      # ── surface 1: the first-run gate on a fresh home ──
+      - name: Boot the first-run gateway
+        id: gate_gw
+        if: ${{ !cancelled() && steps.capzero.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          python "$SHOTS/gateway.py" --measurements "$MEASUREMENTS" \
+            start --name gate --home "$GATE_HOME" --log-dir "$SHOTS_OUT/logs" --state "$STATE_DIR/gate.json"
+
+      - name: Read the gate's prerequisite payload
+        if: ${{ !cancelled() && steps.gate_gw.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          python "$SHOTS/gateway.py" --measurements "$MEASUREMENTS" api \
+            --state "$STATE_DIR/gate.json" --path '/api/kiro-prerequisite?refresh=explicit' \
+            --key gateways.gate.prerequisite \
+            --expect status=200 \
+            --expect 'sandbox_unavailable=true' \
+            --expect 'sandbox_failure_kind="transient"' \
+            --expect 'sandbox_remedy="userns_cap_zero"' \
+            --expect 'initial_setup_complete=false' \
+            --contains 'sandbox_detail~ENOSPC'
+
+      - name: Run kirocrew doctor on the first-run home
+        if: ${{ !cancelled() && steps.capzero.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          python "$SHOTS/gateway.py" --measurements "$MEASUREMENTS" doctor \
+            --home "$GATE_HOME" --out "$SHOTS_OUT/doctor.txt"
+
+      - name: Shoot the gate (light, dark)
+        if: ${{ !cancelled() && steps.gate_gw.outcome == 'success' }}
+        continue-on-error: true
+        run: node "$SHOTS/capture.mjs" gate "$STATE_DIR/gate.json"
+
+      - name: Collect the gate gateway's log evidence
+        if: ${{ !cancelled() && steps.gate_gw.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          python "$SHOTS/gateway.py" --measurements "$MEASUREMENTS" log-lines \
+            --state "$STATE_DIR/gate.json" --key gateways.gate.log_lines
+
+      - name: Stop the first-run gateway
+        if: always()
+        run: python "$SHOTS/gateway.py" --measurements "$MEASUREMENTS" stop --state "$STATE_DIR/gate.json"
+
+      # ── surface 2: Settings > Remote Crew on the established home ──
+      - name: Boot the established gateway
+        id: crew_gw
+        if: ${{ !cancelled() && steps.capzero.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          python "$SHOTS/gateway.py" --measurements "$MEASUREMENTS" \
+            start --name crew --home "$CREW_HOME" --log-dir "$SHOTS_OUT/logs" --state "$STATE_DIR/crew.json"
+
+      - name: Read the AWS preflight refusal
+        if: ${{ !cancelled() && steps.crew_gw.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          python "$SHOTS/gateway.py" --measurements "$MEASUREMENTS" api \
+            --state "$STATE_DIR/crew.json" --path /api/cloud/preflight \
+            --key gateways.crew.preflight \
+            --expect status=503 \
+            --expect 'code="sandbox_unavailable"' \
+            --expect 'remedy="userns_cap_zero"' \
+            --contains 'error~user.max_user_namespaces=0'
+          python "$SHOTS/gateway.py" --measurements "$MEASUREMENTS" api \
+            --state "$STATE_DIR/crew.json" --path /api/kiro-prerequisite \
+            --key gateways.crew.prerequisite \
+            --expect 'initial_setup_complete=true'
+
+      - name: Shoot Remote Crew (light, dark)
+        if: ${{ !cancelled() && steps.crew_gw.outcome == 'success' }}
+        continue-on-error: true
+        run: node "$SHOTS/capture.mjs" crew "$STATE_DIR/crew.json"
+
+      - name: Collect the established gateway's log evidence
+        if: ${{ !cancelled() && steps.crew_gw.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          python "$SHOTS/gateway.py" --measurements "$MEASUREMENTS" log-lines \
+            --state "$STATE_DIR/crew.json" --key gateways.crew.log_lines
+
+      - name: Stop the established gateway
+        if: always()
+        run: python "$SHOTS/gateway.py" --measurements "$MEASUREMENTS" stop --state "$STATE_DIR/crew.json"
+
+      # ── put the host back, scrub, upload, verdict ──
+      - name: Restore the user-namespace settings
+        if: always()
+        run: |
+          set -uo pipefail
+          if [ -n "${USERNS_CAP_ORIG:-}" ]; then
+            sudo sysctl -w user.max_user_namespaces="$USERNS_CAP_ORIG"
+          fi
+          if [ -n "${APPARMOR_USERNS_ORIG:-}" ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns="$APPARMOR_USERNS_ORIG"
+          fi
+          python "$SHOTS/gateway.py" --measurements "$MEASUREMENTS" host-state --label restored || true
+
+      # The tokens belong to gateways that died with this job, but the artifact
+      # is public: scrub every log before upload.
+      - name: Scrub the sign-in tokens from the logs
+        if: always()
+        run: |
+          shopt -s nullglob
+          python "$SHOTS/gateway.py" --measurements "$MEASUREMENTS" scrub \
+            --state "$STATE_DIR/seed.json" --state "$STATE_DIR/gate.json" --state "$STATE_DIR/crew.json" \
+            "$SHOTS_OUT"/logs/*.log "$SHOTS_OUT"/doctor.txt "$MEASUREMENTS"
+          ls -la "$SHOTS_OUT" "$SHOTS_OUT/logs"
+
+      - name: Upload screenshots, measurements and gateway logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: shots-32211
+          path: ${{ env.SHOTS_OUT }}
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Verdict
+        if: always()
+        run: |
+          python "$SHOTS/gateway.py" --measurements "$MEASUREMENTS" verdict \
+            --require "host: user.max_user_namespaces is 0" \
+            --require "gateways.gate.prerequisite" \
+            --require "doctor:" \
+            --require "linux-gate-cap-zero-light" \
+            --require "linux-gate-cap-zero-dark" \
+            --require "gateways.crew.preflight" \
+            --require "linux-remote-crew-cap-zero:" \
+            --require "linux-remote-crew-cap-zero-dark" \
+            --require "gateways.gate.log_lines"
