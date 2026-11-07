@@ -1,0 +1,70 @@
+name: Tests 32211 (throwaway)
+
+# THROWAWAY, never part of a pull request. Runs the website tests PR #32211
+# touches, plus the full i18n check with its diff-scoped checks against the
+# PR's base, on a clean npm ci.
+
+on:
+  push:
+    branches: [ci/32211-linux-screenshots]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-32211-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  website:
+    name: Website tests for PR 32211
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      PR_BASE: e30915e712a52b1cf604afe39587b44d243e9567
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: website/package-lock.json
+
+      - name: Install frontend deps
+        working-directory: website
+        run: npm ci --no-audit --no-fund
+
+      - name: Vitest (the files the PR touches, plus the i18n suites)
+        working-directory: website
+        run: >
+          npx vitest run
+          src/test/KiroPrerequisiteGate.test.tsx
+          src/test/RemoteCrewPanelPluginRefusal.test.tsx
+          src/i18n/catalogParity.test.ts
+          src/i18n/pseudolocale.test.ts
+          src/i18n/pseudolocaleBundle.test.ts
+          src/i18n/keyReference.test.ts
+          src/i18n/deadKeys.test.ts
+          src/i18n/untranslatedRatchet.test.ts
+
+      - name: i18n check, diff-scoped against the PR base
+        if: ${{ !cancelled() }}
+        working-directory: website
+        env:
+          I18N_BASE_REF: ${{ env.PR_BASE }}
+        run: npm run i18n:check
+
+      - name: Typecheck
+        if: ${{ !cancelled() }}
+        working-directory: website
+        run: npx tsc --noEmit -p .
+
+      - name: Full website test suite
+        if: ${{ !cancelled() }}
+        working-directory: website
+        run: npm run test
