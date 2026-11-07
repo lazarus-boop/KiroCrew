@@ -25,7 +25,9 @@ concurrency:
 jobs:
   shots:
     name: Linux screenshots (user.max_user_namespaces=0)
-    runs-on: ubuntu-latest
+    # ubuntu-latest is 26.04, where this Playwright has no Chromium build; 24.04
+    # is also the release the issue was reported on.
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
