@@ -18,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        install: ["main"]
+        install: ["main", "v0.12.1", "v0.12.2"]
     runs-on: windows-latest
     timeout-minutes: 20
     env:
@@ -26,6 +26,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         if: matrix.install == 'main'
+
+      - name: Download the release wheel and desktop installer
+        if: matrix.install != 'main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $dl = "$env:RUNNER_TEMP\rel"
+          gh release download "${{ matrix.install }}" -R kirodotdev/KiroCrew -D $dl -p "*.whl" -p "*Setup-x64.exe"
+          if ($LASTEXITCODE -ne 0) { throw "download failed" }
+          Get-ChildItem $dl
+          "REL_DIR=$dl" >> $env:GITHUB_ENV
 
       - uses: actions/setup-python@v5
         with:
@@ -39,8 +51,8 @@ jobs:
           if ("${{ matrix.install }}" -eq "main") {
             & $py -m pip install --disable-pip-version-check -q .
           } else {
-            $ver = "${{ matrix.install }}".Split("==")[-1]
-            & $py -m pip install --disable-pip-version-check -q "kirocrew==$ver"
+            $whl = (Get-ChildItem "$env:REL_DIR\*.whl")[0].FullName
+            & $py -m pip install --disable-pip-version-check -q $whl
           }
           if ($LASTEXITCODE -ne 0) { throw "install failed" }
           & $py -s -P -m kiro_crew --version
@@ -92,6 +104,20 @@ jobs:
           "KC_EXE=$env:RUNNER_TEMP\kc\Scripts\kirocrew.exe" >> $env:GITHUB_ENV
           "KIROCREW_HOME=$home1" >> $env:GITHUB_ENV
 
+      - name: Install the desktop app silently and find its kirocrew.cmd
+        if: matrix.install != 'main'
+        shell: pwsh
+        run: |
+          $setup = (Get-ChildItem "$env:REL_DIR\*Setup-x64.exe")[0].FullName
+          Start-Process -Wait -FilePath $setup -ArgumentList "/S"
+          $cmd = Get-ChildItem -Recurse -ErrorAction SilentlyContinue -Filter kirocrew.cmd `
+            "$env:LOCALAPPDATA\Programs", "$env:ProgramFiles" |
+            Where-Object { $_.FullName -like "*backend-dist*\bin\kirocrew.cmd" } | Select-Object -First 1
+          if (-not $cmd) { throw "desktop kirocrew.cmd not found after install" }
+          Write-Host "desktop shim: $($cmd.FullName)"
+          & $cmd.FullName --version
+          "KC_DESKTOP=$($cmd.FullName)" >> $env:GITHUB_ENV
+
       - name: Run from PowerShell
         shell: pwsh
         run: |
@@ -99,7 +125,9 @@ jobs:
           "### PowerShell (${{ matrix.install }})" >> $env:GITHUB_STEP_SUMMARY
           "| launcher | args | exit |" >> $env:GITHUB_STEP_SUMMARY
           "|---|---|---|" >> $env:GITHUB_STEP_SUMMARY
-          foreach ($launcher in @($env:KC_EXE, $env:KC_SHIM)) {
+          $launchers = @($env:KC_EXE, $env:KC_SHIM)
+          if ($env:KC_DESKTOP) { $launchers += $env:KC_DESKTOP }
+          foreach ($launcher in $launchers) {
             foreach ($a in @(@("cloud", "status"), @("cloud", "status", "--tag", "kc-528539", "--region", "us-west-2"))) {
               Write-Host "===== $launcher $($a -join ' ')"
               & $launcher @a
@@ -122,5 +150,9 @@ jobs:
           echo ===== exit=%ERRORLEVEL%
           echo ===== "%KC_SHIM%" cloud status --tag kc-528539 --region us-west-2
           call "%KC_SHIM%" cloud status --tag kc-528539 --region us-west-2
+          echo ===== exit=%ERRORLEVEL%
+          if not defined KC_DESKTOP exit /b 0
+          echo ===== "%KC_DESKTOP%" cloud status
+          call "%KC_DESKTOP%" cloud status
           echo ===== exit=%ERRORLEVEL%
           exit /b 0
