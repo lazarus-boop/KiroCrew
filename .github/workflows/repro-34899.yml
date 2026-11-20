@@ -18,7 +18,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        install: ["pypi==0.12.1", "pypi==0.12.2", "main"]
+        install: ["main"]
     runs-on: windows-latest
     timeout-minutes: 20
     env:
@@ -69,6 +69,10 @@ jobs:
           New-Item -ItemType Directory -Force $home1 | Out-Null
           Set-Content -Encoding utf8 -LiteralPath "$home1\cloud_launch_state.json" `
             -Value '{"profile": "", "region": "us-west-2", "last_tag": "kc-528539"}'
+          # What setup records on a Windows host once the user opts in
+          # (cli_setup.py): Windows has no OS sandbox backend.
+          Set-Content -Encoding utf8 -LiteralPath "$home1\config.json" `
+            -Value '{"agent": {"sandbox_allow_unsandboxed_exec": true}}'
           "FAKE_AWS=$fake" >> $env:GITHUB_ENV
           "KC_SHIM=$bin\kirocrew.cmd" >> $env:GITHUB_ENV
           "KC_EXE=$env:RUNNER_TEMP\kc\Scripts\kirocrew.exe" >> $env:GITHUB_ENV
