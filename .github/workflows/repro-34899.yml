@@ -50,14 +50,28 @@ jobs:
         run: |
           $fake = "$env:RUNNER_TEMP\fakeaws"
           New-Item -ItemType Directory -Force $fake | Out-Null
-          $json = '{"Stacks":[{"StackName":"kirocrew-kc-528539","StackStatus":"CREATE_COMPLETE","Tags":[{"Key":"kirocrew:managed","Value":"true"}],"Outputs":[{"OutputKey":"InstanceId","OutputValue":"i-0abc"},{"OutputKey":"Region","OutputValue":"us-west-2"}]}]}'
+          # A Python fake, so no cmd parsing touches the canned JSON.
+          Set-Content -Encoding utf8 -LiteralPath "$fake\fake_aws.py" -Value @(
+            'import json, sys',
+            'args = " ".join(sys.argv[1:])',
+            'if "describe-stacks" in args:',
+            '    print(json.dumps({"Stacks": [{"StackName": "kirocrew-kc-528539", "StackStatus": "CREATE_COMPLETE",',
+            '        "Tags": [{"Key": "kirocrew:managed", "Value": "true"}],',
+            '        "Outputs": [{"OutputKey": "InstanceId", "OutputValue": "i-0abc"},',
+            '                    {"OutputKey": "Region", "OutputValue": "us-west-2"}]}]}))',
+            'elif "describe-instances" in args:',
+            '    print("running")',
+            'else:',
+            '    sys.stderr.write("unexpected aws call: " + args + "\\n")',
+            '    sys.exit(2)'
+          )
+          $py = "$env:RUNNER_TEMP\kc\Scripts\python.exe"
           Set-Content -Encoding ascii -LiteralPath "$fake\aws.cmd" -Value @(
             '@echo off',
-            'echo %* | findstr /c:"describe-stacks" >nul && (echo ' + $json + '& exit /b 0)',
-            'echo %* | findstr /c:"describe-instances" >nul && (echo running& exit /b 0)',
-            'echo unexpected aws call: %* 1>&2',
-            'exit /b 2'
+            ('"' + $py + '" -s -P "%~dp0fake_aws.py" %*')
           )
+          & $py -s -P "$fake\fake_aws.py" cloudformation describe-stacks
+          if ($LASTEXITCODE -ne 0) { throw "fake aws self-check failed" }
           # The desktop bundle's relocatable shim, as packaging/build-desktop.sh writes it.
           $bin = "$env:RUNNER_TEMP\kc\bin"
           New-Item -ItemType Directory -Force $bin | Out-Null
