@@ -1,0 +1,108 @@
+name: repro-34899 (cloud status exit code on Windows)
+
+# Throwaway reproduction for kirodotdev/KiroCrew#34899, run on a fork only.
+# Never part of a pull request. Runs `kirocrew cloud status` against a fake
+# `aws` CLI for a healthy crew and records the exit code each launcher and
+# shell reports.
+
+on:
+  push:
+    branches: [ci/34899-windows-repro]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  repro:
+    strategy:
+      fail-fast: false
+      matrix:
+        install: ["pypi==0.12.1", "pypi==0.12.2", "main"]
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+        if: matrix.install == 'main'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Kiro Crew
+        shell: pwsh
+        run: |
+          python -m venv "$env:RUNNER_TEMP\kc"
+          $py = "$env:RUNNER_TEMP\kc\Scripts\python.exe"
+          if ("${{ matrix.install }}" -eq "main") {
+            & $py -m pip install --disable-pip-version-check -q .
+          } else {
+            $ver = "${{ matrix.install }}".Split("==")[-1]
+            & $py -m pip install --disable-pip-version-check -q "kirocrew==$ver"
+          }
+          if ($LASTEXITCODE -ne 0) { throw "install failed" }
+          & $py -s -P -m kiro_crew --version
+
+      - name: Fake aws CLI, desktop-style shim, launch record
+        shell: pwsh
+        run: |
+          $fake = "$env:RUNNER_TEMP\fakeaws"
+          New-Item -ItemType Directory -Force $fake | Out-Null
+          $json = '{"Stacks":[{"StackName":"kirocrew-kc-528539","StackStatus":"CREATE_COMPLETE","Tags":[{"Key":"kirocrew:managed","Value":"true"}],"Outputs":[{"OutputKey":"InstanceId","OutputValue":"i-0abc"},{"OutputKey":"Region","OutputValue":"us-west-2"}]}]}'
+          Set-Content -Encoding ascii -LiteralPath "$fake\aws.cmd" -Value @(
+            '@echo off',
+            'echo %* | findstr /c:"describe-stacks" >nul && (echo ' + $json + '& exit /b 0)',
+            'echo %* | findstr /c:"describe-instances" >nul && (echo running& exit /b 0)',
+            'echo unexpected aws call: %* 1>&2',
+            'exit /b 2'
+          )
+          # The desktop bundle's relocatable shim, as packaging/build-desktop.sh writes it.
+          $bin = "$env:RUNNER_TEMP\kc\bin"
+          New-Item -ItemType Directory -Force $bin | Out-Null
+          Set-Content -Encoding ascii -LiteralPath "$bin\kirocrew.cmd" -Value @(
+            '@echo off', 'setlocal', 'set "PYTHONPATH="', 'set "PYTHONHOME="',
+            '"%~dp0..\Scripts\python.exe" -s -P -m kiro_crew %*'
+          )
+          $home1 = "$env:RUNNER_TEMP\kchome"
+          New-Item -ItemType Directory -Force $home1 | Out-Null
+          Set-Content -Encoding utf8 -LiteralPath "$home1\cloud_launch_state.json" `
+            -Value '{"profile": "", "region": "us-west-2", "last_tag": "kc-528539"}'
+          "FAKE_AWS=$fake" >> $env:GITHUB_ENV
+          "KC_SHIM=$bin\kirocrew.cmd" >> $env:GITHUB_ENV
+          "KC_EXE=$env:RUNNER_TEMP\kc\Scripts\kirocrew.exe" >> $env:GITHUB_ENV
+          "KIROCREW_HOME=$home1" >> $env:GITHUB_ENV
+
+      - name: Run from PowerShell
+        shell: pwsh
+        run: |
+          $env:PATH = "$env:FAKE_AWS;$env:PATH"
+          "### PowerShell (${{ matrix.install }})" >> $env:GITHUB_STEP_SUMMARY
+          "| launcher | args | exit |" >> $env:GITHUB_STEP_SUMMARY
+          "|---|---|---|" >> $env:GITHUB_STEP_SUMMARY
+          foreach ($launcher in @($env:KC_EXE, $env:KC_SHIM)) {
+            foreach ($a in @(@("cloud", "status"), @("cloud", "status", "--tag", "kc-528539", "--region", "us-west-2"))) {
+              Write-Host "===== $launcher $($a -join ' ')"
+              & $launcher @a
+              $rc = $LASTEXITCODE
+              Write-Host "===== exit=$rc"
+              "| $(Split-Path $launcher -Leaf) | $($a -join ' ') | $rc |" >> $env:GITHUB_STEP_SUMMARY
+            }
+          }
+          exit 0
+
+      - name: Run from cmd
+        shell: cmd
+        run: |
+          set "PATH=%FAKE_AWS%;%PATH%"
+          echo ===== "%KC_EXE%" cloud status
+          "%KC_EXE%" cloud status
+          echo ===== exit=%ERRORLEVEL%
+          echo ===== "%KC_SHIM%" cloud status
+          call "%KC_SHIM%" cloud status
+          echo ===== exit=%ERRORLEVEL%
+          echo ===== "%KC_SHIM%" cloud status --tag kc-528539 --region us-west-2
+          call "%KC_SHIM%" cloud status --tag kc-528539 --region us-west-2
+          echo ===== exit=%ERRORLEVEL%
+          exit /b 0
